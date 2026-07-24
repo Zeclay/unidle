@@ -534,6 +534,54 @@ def setup_macos_menu_bar_only():
         pass
 
 
+def macos_accessibility_trusted():
+    """Return True if this process already has Accessibility permission.
+
+    Returns True on any failure (or non-macOS) so we never nag when we
+    can't actually tell — the keypress path degrades safely on its own.
+    """
+    if sys.platform != "darwin":
+        return True
+    try:
+        import ApplicationServices
+
+        return bool(ApplicationServices.AXIsProcessTrusted())
+    except Exception:
+        return True
+
+
+def request_macos_accessibility():
+    """Pop the native Accessibility permission dialog on macOS.
+
+    ``AXIsProcessTrustedWithOptions`` with the prompt option shows the
+    system dialog ("Unidle would like to control this computer…") with an
+    Open System Settings button, taking the user straight to the right
+    pane. If the framework isn't available, fall back to opening that pane
+    directly. Best-effort and fully wrapped: it must never raise.
+    """
+    try:
+        import ApplicationServices
+
+        options = {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
+        return bool(
+            ApplicationServices.AXIsProcessTrustedWithOptions(options)
+        )
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            [
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security"
+                "?Privacy_Accessibility",
+            ],
+            check=False,
+        )
+    except Exception:
+        pass
+    return False
+
+
 def setup_macos_double_click(icon, app):
     try:
         import AppKit
@@ -1627,11 +1675,16 @@ class UnidleApp:
         except Exception:
             pass
 
-        if self.first_run and sys.platform == "darwin":
+        # macOS: proactively request Accessibility permission. We ask
+        # whenever it isn't granted yet — not just on first run — so a user
+        # who dismissed it once still gets prompted on the next launch
+        # instead of silently having dead keypresses. The system dialog has
+        # an "Open System Settings" button that lands on the right pane.
+        if sys.platform == "darwin" and not macos_accessibility_trusted():
+            request_macos_accessibility()
             self.notify(
-                "Grant Accessibility (and Input Monitoring) permission in "
-                "System Settings so Unidle can send keypresses and use the "
-                "global hotkey.",
+                "Enable Unidle under Accessibility (and Input Monitoring, if "
+                "keypresses still don't work), then it's ready to go.",
                 title="Unidle — permission needed",
             )
 
