@@ -32,6 +32,7 @@ APP_NAME = "Unidle"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".unidle.json")
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".unidle_log.jsonl")
 LAST_KEYPRESS_PATH = os.path.join(os.path.expanduser("~"), ".unidle_last.json")
+SETTINGS_PID_PATH = os.path.join(os.path.expanduser("~"), ".unidle_settings.pid")
 LOG_MAX_LINES = 500
 LOG_TRUNCATE_CHECK_INTERVAL = 100  # only check/truncate every N appends; cheap
 SINGLE_INSTANCE_PORT = 58731  # localhost-only mutex; OS frees it if we crash
@@ -285,6 +286,62 @@ def _config_mtime():
 
 def is_frozen():
     return getattr(sys, "frozen", False)
+
+
+def _macos_bundle_path():
+    """Return the .app bundle path when running frozen inside one, else None.
+
+    Inside a bundle, ``sys.executable`` is
+    ``<Bundle>.app/Contents/MacOS/<exe>``; strip that tail to get the .app so
+    we can relaunch through LaunchServices under the same bundle identity.
+    """
+    marker = "/Contents/MacOS/"
+    idx = sys.executable.find(marker)
+    if idx == -1:
+        return None
+    bundle = sys.executable[:idx]
+    return bundle if bundle.endswith(".app") else None
+
+
+def _write_settings_pid():
+    """Marker so the tray app can tell the Settings window is open.
+
+    Needed because the macOS launch path (`open -n -a`) returns immediately,
+    so the tray app can't track the real Settings child via its own Popen
+    handle. The --settings process owns this file: written on start, removed
+    on exit; a live pid in it means the window is open.
+    """
+    try:
+        with open(SETTINGS_PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _clear_settings_pid():
+    try:
+        os.remove(SETTINGS_PID_PATH)
+    except OSError:
+        pass
+
+
+def _settings_pid_alive():
+    """True if SETTINGS_PID_PATH names a live process; cleans up if stale."""
+    try:
+        with open(SETTINGS_PID_PATH) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _clear_settings_pid()  # stale marker; owner is gone
+        return False
+    except PermissionError:
+        return True  # exists but not ours to signal — still alive
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1345,7 @@ class UnidleApp:
         self.icon.icon = self._current_icon_image()
         self.icon.title = APP_NAME
         self._settings_process = None
+        self._settings_launch_time = None
         self._last_config_mtime = _config_mtime()
         self._last_wh_status = None
 
@@ -1299,19 +1357,52 @@ class UnidleApp:
 
     # -- settings window / hot-reload -------------------------------------------------
     def settings_window_open(self):
+        # Source of truth is the pid marker the --settings process maintains:
+        # on macOS frozen we launch via `open`, which returns immediately, so
+        # our own _settings_process handle can't see the real child.
+        if _settings_pid_alive():
+            return True
+        # A launch we just kicked off may not have written its marker yet;
+        # treat that brief window as "open" so a quick second click can't
+        # spawn a duplicate Settings window.
+        if (
+            self._settings_launch_time is not None
+            and time.time() - self._settings_launch_time < 4
+        ):
+            return True
+        # Fallback for the direct-Popen path (running from source, or if the
+        # macOS `open` launch failed and we fell back to Popen).
         return self._settings_process is not None and self._settings_process.poll() is None
 
     def open_settings(self, icon=None, item=None):
         if self.settings_window_open():
             return
-        if is_frozen():
-            args = [sys.executable, "--settings"]
-        else:
-            args = [sys.executable, os.path.abspath(__file__), "--settings"]
+        args = None
+        if is_frozen() and sys.platform == "darwin":
+            # Relaunch through LaunchServices so the Settings process runs
+            # under the SAME bundle identity as the tray app. Popen-ing the
+            # inner binary directly makes macOS TCC treat it as a separate
+            # app and create a duplicate Accessibility entry (see HANDOFF).
+            bundle = _macos_bundle_path()
+            if bundle:
+                args = ["open", "-n", "-a", bundle, "--args", "--settings"]
+        if args is None:
+            if is_frozen():
+                args = [sys.executable, "--settings"]
+            else:
+                args = [sys.executable, os.path.abspath(__file__), "--settings"]
         try:
             self._settings_process = subprocess.Popen(args)
+            self._settings_launch_time = time.time()
         except Exception:
-            pass
+            # If `open` failed, fall back to spawning the binary directly so
+            # Settings still opens (accepting the duplicate-entry tradeoff).
+            if args and args[0] == "open":
+                try:
+                    self._settings_process = subprocess.Popen([sys.executable, "--settings"])
+                    self._settings_launch_time = time.time()
+                except Exception:
+                    pass
 
     def check_config_reload(self):
         mtime = _config_mtime()
@@ -1722,7 +1813,11 @@ def main():
     if "--settings" in sys.argv[1:]:
         from settings_ui import run_settings_window
 
-        run_settings_window(CONFIG_PATH)
+        _write_settings_pid()
+        try:
+            run_settings_window(CONFIG_PATH)
+        finally:
+            _clear_settings_pid()
         return
 
     if not acquire_single_instance():
