@@ -9,13 +9,12 @@ python assets/generate_icon.py
 
 pyinstaller --onefile --windowed --name Unidle --icon assets/icon.icns unidle.py
 
+# Make it a menu-bar-only (agent) app: LSUIElement stops macOS from ever
+# giving it a Dock icon. Baking it into Info.plist here means there is no
+# Dock icon to flash and get stuck on launch — the runtime activation-policy
+# call in unidle.py is only a fallback for running from source.
+plutil -replace LSUIElement -bool true dist/Unidle.app/Contents/Info.plist \
+  || plutil -insert LSUIElement -bool true dist/Unidle.app/Contents/Info.plist
+
 echo
-echo "Build complete: dist/Unidle.app"
-echo
-echo "Note: to make this a tray-only app with no Dock icon, add a"
-echo "LSUIElement key to dist/Unidle.app/Contents/Info.plist:"
-echo
-echo "  <key>LSUIElement</key><true/>"
-echo
-echo "Or pass --osx-bundle-identifier plus a custom Info.plist to"
-echo "pyinstaller so it's baked in automatically on every build."
+echo "Build complete: dist/Unidle.app (menu-bar-only, no Dock icon)"

@@ -34,7 +34,10 @@ jobs:
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --windowed --name Unidle --icon assets/icon.icns unidle.py
+        run: |
+          pyinstaller --onefile --windowed --name Unidle --icon assets/icon.icns unidle.py
+          plutil -replace LSUIElement -bool true dist/Unidle.app/Contents/Info.plist \
+            || plutil -insert LSUIElement -bool true dist/Unidle.app/Contents/Info.plist
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
