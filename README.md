@@ -33,10 +33,6 @@ The default interval (1 minute) is comfortably inside all of these.
 These thresholds are the apps' defaults and can change or be overridden
 by your organization.
 
-> **Upgrading from "Always Online"?** Your settings and activity history
-> move over automatically the first time you launch the new version — see
-> [Upgrading from Always Online](#upgrading-from-always-online) below.
-
 ## Requirements
 
 - Python 3.10+
@@ -149,27 +145,6 @@ pywebview will fail to open the window — install it from
 if that happens.
 
 **macOS:** uses the built-in WKWebView, no extra runtime needed.
-
-## Upgrading from "Always Online"
-
-This project used to be called "Always Online". If you have an older copy
-installed, the first time you launch the new version it silently moves
-your existing settings and activity history over:
-
-| Old file | New file |
-|---|---|
-| `~/.always_online.json` | `~/.unidle.json` |
-| `~/.always_online_log.jsonl` | `~/.unidle_log.jsonl` |
-| `~/.always_online_last.json` | `~/.unidle_last.json` |
-
-Nothing to do on your part — no settings are lost, and the old files are
-removed once the move is done. If it fails for any reason, the app just
-falls back to defaults, the same as a fresh install.
-
-**Before your first launch of the new version**, quit any old "Always
-Online" copy that's still running. The single-instance lock changed along
-with the rename, so a running old copy won't be detected by the new one —
-you could otherwise end up with two copies sending keypresses at once.
 
 ## Important notes
 
