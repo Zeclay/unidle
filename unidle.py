@@ -545,13 +545,31 @@ def setup_macos_double_click(icon, app):
 
     def _on_click(_self, _sender):
         try:
-            click_count = nsapp.currentEvent().clickCount()
+            event = nsapp.currentEvent()
+            event_type = event.type()
+            click_count = event.clickCount()
         except Exception:
+            event_type = None
             click_count = 1
         existing_timer = state["timer"]
         if existing_timer is not None:
             existing_timer.cancel()
             state["timer"] = None
+        # Right-click (or control-click, which macOS reports as a right
+        # mouse up) opens the menu immediately — no double-click wait, since
+        # right-click has no "open Settings" gesture to disambiguate from.
+        is_right_click = event_type == AppKit.NSEventTypeRightMouseUp
+        if not is_right_click and event_type == AppKit.NSEventTypeLeftMouseUp:
+            try:
+                ctrl_held = bool(
+                    event.modifierFlags() & AppKit.NSEventModifierFlagControl
+                )
+            except Exception:
+                ctrl_held = False
+            is_right_click = ctrl_held
+        if is_right_click:
+            _show_menu_now()
+            return
         if click_count >= 2:
             try:
                 app.open_settings()
@@ -569,7 +587,9 @@ def setup_macos_double_click(icon, app):
         objc.classAddMethods(type(delegate), [action])
         button.setTarget_(delegate)
         button.setAction_(selector_name)
-        button.sendActionOn_(AppKit.NSEventMaskLeftMouseUp)
+        button.sendActionOn_(
+            AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp
+        )
 
         def _patched_update_menu():
             original_update_menu()
