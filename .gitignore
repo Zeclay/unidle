@@ -10,4 +10,5 @@ IDEA.md
 assets/*.ico
 assets/*.icns
 assets/*.png
+!assets/icon_256.png
 assets/icon.iconset/
