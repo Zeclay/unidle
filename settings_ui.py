@@ -16,15 +16,21 @@ import threading
 from datetime import datetime
 
 import webview
+from pynput.keyboard import HotKey
 
 INTERVAL_CHOICES = [30, 60, 120, 300]
 AUTO_STOP_CHOICES = {"Off": 0, "1h": 3600, "4h": 4 * 3600, "8h": 8 * 3600}
+ACTIVITY_MODES = ("f15", "mouse", "scroll")
+APP_TRIGGER_IDS = ("teams", "slack", "zoom", "webex", "discord", "gchat")
 
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".unidle_log.jsonl")
 LAST_KEYPRESS_PATH = os.path.join(os.path.expanduser("~"), ".unidle_last.json")
 ACTIVITY_EVENTS_SHOWN = 10
 
-# (icon, human text). "auto_stop" gets its duration appended when present.
+# (icon, human text). "auto_stop"/"battery_pause"/"profile_applied" get
+# their detail appended when present. "keypress" is the pre-PLAN-5 event
+# name (F15-only); "activity" is its replacement across all activity
+# modes — both map to the same text so old log lines keep reading fine.
 EVENT_TEXT = {
     "app_start": ("🚀", "App started"),
     "app_quit": ("🛑", "App quit"),
@@ -34,6 +40,12 @@ EVENT_TEXT = {
     "wh_enter": ("🌤️", "Entered working hours"),
     "wh_exit": ("🌙", "Left working hours"),
     "keypress": ("⌨️", "Resumed sending keypresses"),
+    "activity": ("⌨️", "Resumed sending activity"),
+    "lock_pause": ("🔒", "Paused — screen locked"),
+    "unlock_resume": ("🔓", "Resumed — screen unlocked"),
+    "battery_pause": ("🔋", "Paused — low battery"),
+    "battery_resume": ("🔌", "Resumed — battery okay"),
+    "profile_applied": ("📁", "Applied profile"),
 }
 
 DEFAULT_SETTINGS = {
@@ -46,9 +58,29 @@ DEFAULT_SETTINGS = {
     "working_days": [0, 1, 2, 3, 4],
     "auto_stop_choice": "Off",
     "notifications_enabled": False,
+    # Phase 1 (PLAN-5)
+    "activity_mode": "f15",
+    "smart_idle": True,
+    "smart_idle_threshold": 30,
+    "keep_system_awake": False,
+    "keep_display_awake": False,
+    "pause_on_low_battery": True,
+    "low_battery_percent": 20,
+    "hotkey_enabled": False,
+    "hotkey": "<ctrl>+<alt>+u",
+    # Phase 2 (PLAN-5)
+    "app_trigger_enabled": False,
+    "app_trigger_apps": ["teams"],
+    "app_trigger_custom": [],
+    "autostart": False,
+    "profiles": {},
+    "active_profile": None,
 }
 
 SETTINGS_KEYS = tuple(DEFAULT_SETTINGS.keys())
+# Keys captured in a profile snapshot — everything except the profile
+# bookkeeping keys themselves (a profile must never nest "profiles").
+PROFILE_KEYS = tuple(k for k in SETTINGS_KEYS if k not in ("profiles", "active_profile"))
 
 
 def _is_valid_time_str(value):
@@ -67,6 +99,38 @@ def _is_valid_days(value):
         and len(value) > 0
         and all(isinstance(d, int) and 0 <= d <= 6 for d in value)
     )
+
+
+def _is_valid_percent(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
+
+
+def _is_valid_hotkey(value):
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        HotKey.parse(value)
+        return True
+    except Exception:
+        return False
+
+
+def _is_valid_string_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_valid_app_trigger_apps(value):
+    return isinstance(value, list) and all(isinstance(v, str) and v in APP_TRIGGER_IDS for v in value)
+
+
+def _is_valid_profiles(value):
+    return isinstance(value, dict) and all(
+        isinstance(k, str) and isinstance(v, dict) for k, v in value.items()
+    )
+
+
+def is_frozen():
+    return getattr(sys, "frozen", False)
 
 
 def _load(config_path):
@@ -90,6 +154,33 @@ def _load(config_path):
         for bool_key in ("running", "randomize", "working_hours_enabled", "notifications_enabled"):
             if not isinstance(settings[bool_key], bool):
                 settings[bool_key] = DEFAULT_SETTINGS[bool_key]
+        if settings["activity_mode"] not in ACTIVITY_MODES:
+            settings["activity_mode"] = DEFAULT_SETTINGS["activity_mode"]
+        for bool_key in (
+            "smart_idle",
+            "keep_system_awake",
+            "keep_display_awake",
+            "pause_on_low_battery",
+            "hotkey_enabled",
+            "app_trigger_enabled",
+            "autostart",
+        ):
+            if not isinstance(settings[bool_key], bool):
+                settings[bool_key] = DEFAULT_SETTINGS[bool_key]
+        if not _is_valid_percent(settings["smart_idle_threshold"]) or settings["smart_idle_threshold"] < 1:
+            settings["smart_idle_threshold"] = DEFAULT_SETTINGS["smart_idle_threshold"]
+        if not _is_valid_percent(settings["low_battery_percent"]):
+            settings["low_battery_percent"] = DEFAULT_SETTINGS["low_battery_percent"]
+        if not _is_valid_hotkey(settings["hotkey"]):
+            settings["hotkey"] = DEFAULT_SETTINGS["hotkey"]
+        if not _is_valid_app_trigger_apps(settings["app_trigger_apps"]):
+            settings["app_trigger_apps"] = list(DEFAULT_SETTINGS["app_trigger_apps"])
+        if not _is_valid_string_list(settings["app_trigger_custom"]):
+            settings["app_trigger_custom"] = list(DEFAULT_SETTINGS["app_trigger_custom"])
+        if not _is_valid_profiles(settings["profiles"]):
+            settings["profiles"] = {}
+        if settings["active_profile"] is not None and settings["active_profile"] not in settings["profiles"]:
+            settings["active_profile"] = None
     except Exception:
         pass
     return settings
@@ -123,7 +214,7 @@ def _read_activity():
             last_data = json.load(f)
         dt = _parse_ts(last_data.get("ts", ""))
         if dt is not None:
-            last_text = "Last keypress: " + _format_relative_or_time(dt)
+            last_text = "Last activity: " + _format_relative_or_time(dt)
     except Exception:
         pass
 
@@ -149,6 +240,10 @@ def _read_activity():
             detail = entry.get("detail")
             if event == "auto_stop" and detail:
                 text = f"Auto-stopped after {detail}"
+            elif event == "battery_pause" and detail:
+                text = f"Paused — battery at {detail}"
+            elif event == "profile_applied" and detail:
+                text = f'Applied profile "{detail}"'
             events.append({"icon": icon, "text": text, "time_text": _format_relative_or_time(dt)})
     except Exception:
         pass
@@ -156,22 +251,29 @@ def _read_activity():
     return {"last_keypress_text": last_text, "events": events}
 
 
-def _save(config_path, data):
-    # Merge onto whatever is already on disk so keys this window doesn't
-    # know about (future versions, manual edits) survive untouched.
-    merged = {}
+def _read_raw(config_path):
     try:
         with open(config_path, "r", encoding="utf-8") as f:
-            merged = json.load(f)
+            return json.load(f)
     except Exception:
-        merged = {}
-    for key in SETTINGS_KEYS:
-        if key in data:
-            merged[key] = data[key]
+        return {}
+
+
+def _write_raw(config_path, merged):
     tmp_path = config_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2)
     os.replace(tmp_path, config_path)
+
+
+def _save(config_path, data):
+    # Merge onto whatever is already on disk so keys this window doesn't
+    # know about (future versions, manual edits) survive untouched.
+    merged = _read_raw(config_path)
+    for key in SETTINGS_KEYS:
+        if key in data:
+            merged[key] = data[key]
+    _write_raw(config_path, merged)
 
 
 class Api:
@@ -195,7 +297,13 @@ class Api:
         return _load(self.config_path)
 
     def defaults(self):
-        return dict(DEFAULT_SETTINGS)
+        # Deliberately excludes "profiles"/"active_profile": Reset to
+        # defaults resets the behavior fields in the form, it must never
+        # wipe out the user's saved profiles if they hit Save afterward.
+        return {k: v for k, v in DEFAULT_SETTINGS.items() if k not in ("profiles", "active_profile")}
+
+    def runtime_info(self):
+        return {"autostart_available": is_frozen(), "platform": sys.platform}
 
     def notify_dirty(self, is_dirty):
         self._is_dirty = bool(is_dirty)
@@ -219,7 +327,65 @@ class Api:
                 return {"ok": False, "error": "Invalid end time"}
             if not _is_valid_days(data.get("working_days")):
                 return {"ok": False, "error": "Select at least one day"}
+            if data.get("activity_mode") not in ACTIVITY_MODES:
+                return {"ok": False, "error": "Invalid activity mode"}
+            if not _is_valid_percent(data.get("smart_idle_threshold")) or data.get("smart_idle_threshold") < 1:
+                return {"ok": False, "error": "Invalid smart idle threshold"}
+            if not _is_valid_percent(data.get("low_battery_percent")):
+                return {"ok": False, "error": "Invalid low battery percent"}
+            if data.get("hotkey_enabled") and not _is_valid_hotkey(data.get("hotkey")):
+                return {"ok": False, "error": "Invalid hotkey"}
+            if not _is_valid_app_trigger_apps(data.get("app_trigger_apps")):
+                return {"ok": False, "error": "Invalid app trigger selection"}
+            if not _is_valid_string_list(data.get("app_trigger_custom")):
+                return {"ok": False, "error": "Invalid custom process list"}
             _save(self.config_path, data)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # -- profiles: act directly on disk, independent of the draft/dirty flow -------------------------------------------------
+    def apply_profile(self, name):
+        try:
+            merged = _read_raw(self.config_path)
+            profiles = merged.get("profiles") or {}
+            profile = profiles.get(name)
+            if profile is None:
+                return {"ok": False, "error": "Profile not found"}
+            for key in PROFILE_KEYS:
+                if key in profile:
+                    merged[key] = profile[key]
+            merged["active_profile"] = name
+            _write_raw(self.config_path, merged)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def save_profile(self, name, payload):
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "error": "Name is required"}
+        try:
+            merged = _read_raw(self.config_path)
+            profiles = dict(merged.get("profiles") or {})
+            snapshot = {key: payload[key] for key in PROFILE_KEYS if key in payload}
+            profiles[name] = snapshot
+            merged["profiles"] = profiles
+            merged["active_profile"] = name
+            _write_raw(self.config_path, merged)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def delete_profile(self, name):
+        try:
+            merged = _read_raw(self.config_path)
+            profiles = dict(merged.get("profiles") or {})
+            profiles.pop(name, None)
+            merged["profiles"] = profiles
+            if merged.get("active_profile") == name:
+                merged["active_profile"] = None
+            _write_raw(self.config_path, merged)
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -249,8 +415,8 @@ def run_settings_window(config_path):
         "Unidle — Settings",
         html=_HTML,
         js_api=api,
-        width=440,
-        height=600,
+        width=460,
+        height=640,
         resizable=True,
         min_size=(380, 520),
     )
@@ -351,6 +517,11 @@ _HTML = r"""
 
   .summary { padding: 16px 20px 16px; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
 
+  .section-label {
+    padding: 4px 20px 6px; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--text-muted);
+  }
+
   .card {
     background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
     padding: 16px; margin: 0 20px 16px;
@@ -362,7 +533,7 @@ _HTML = r"""
   .card-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
   .card-body { margin-top: 12px; }
   .card-body.dimmed { opacity: .4; pointer-events: none; }
-  .row { display: flex; align-items: center; justify-content: space-between; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .row + .row { margin-top: 12px; }
 
   .switch { position: relative; width: 40px; height: 24px; flex: none; }
@@ -401,20 +572,24 @@ _HTML = r"""
     transition: .15s;
   }
   .chip.active { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); font-weight: 600; }
+  .chip.disabled { opacity: .4; pointer-events: none; }
 
   .time-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
   .time-field { display: flex; flex-direction: column; gap: 4px; flex: 1; }
   .time-field label { font-size: 11px; color: var(--text-muted); }
-  input[type=time] {
+  input[type=time], input[type=number], input[type=text] {
     font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--bg); color: var(--text); width: 100%;
   }
-  input[type=time].invalid { border-color: var(--danger); }
+  input[type=time].invalid, input[type=number].invalid, input[type=text].invalid { border-color: var(--danger); }
+  .num-field { display: flex; align-items: center; gap: 8px; }
+  .num-field input[type=number] { width: 72px; flex: none; }
 
   .error-text { color: var(--danger); font-size: 11px; margin-top: 6px; display: none; }
   .error-text.show { display: block; }
 
-  .hint { font-size: 11px; color: var(--text-muted); margin-top: 8px; }
+  .hint { font-size: 11px; color: var(--text-muted); margin-top: 8px; line-height: 1.5; }
+  .warn { font-size: 11px; color: var(--danger); margin-top: 6px; }
 
   .footer {
     border-top: 1px solid transparent; padding: 12px 20px;
@@ -438,12 +613,28 @@ _HTML = r"""
   .btn-primary { background: var(--accent); color: var(--accent-contrast); min-width: 84px; }
   .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
   .btn-secondary { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+  .btn-small { padding: 5px 10px; font-size: 11px; border-radius: 6px; }
+  .btn-danger-text { background: transparent; color: var(--danger); border: 1px solid var(--border); }
   .link-reset {
     font-size: 11px; color: var(--text-muted); text-decoration: underline;
     cursor: pointer; background: none; border: none; padding: 0;
   }
   .footer-left { display: flex; align-items: center; gap: 12px; }
   .footer-right { display: flex; align-items: center; gap: 8px; }
+
+  .profile-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+  }
+  .profile-row:last-child { border-bottom: none; }
+  .profile-name { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .profile-active-badge {
+    font-size: 10px; font-weight: 700; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 999px; padding: 1px 6px;
+  }
+  .profile-actions { display: flex; gap: 6px; }
+  .save-profile-row { display: flex; gap: 8px; margin-top: 12px; }
+  .save-profile-row input { flex: 1; }
 
   .modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,.4);
@@ -500,7 +691,7 @@ _HTML = r"""
       <div class="card-header">
         <div>
           <div class="card-title">Working hours</div>
-          <div class="card-sub">Only send keypresses inside this schedule</div>
+          <div class="card-sub">Only send activity inside this schedule</div>
         </div>
         <label class="switch">
           <input type="checkbox" id="workingHoursToggle">
@@ -559,6 +750,149 @@ _HTML = r"""
       </div>
     </div>
 
+    <div class="section-label">Energy &amp; behavior</div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Activity mode</div>
+      </div>
+      <div class="card-body">
+        <div class="segmented" id="activityModeSegmented">
+          <button data-value="f15">F15 key</button>
+          <button data-value="mouse">Mouse</button>
+          <button data-value="scroll">Scroll</button>
+        </div>
+        <div class="hint">F15 is invisible and does nothing in any app. Mouse/scroll nudge by one unit and back — use these only if something filters synthetic key presses.</div>
+        <div class="row" style="margin-top: 14px;">
+          <div>
+            <div>Smart idle</div>
+            <div class="card-sub">Only send when you're actually away</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="smartIdleToggle">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="num-field" id="smartIdleThresholdRow" style="margin-top: 10px;">
+          <span>Idle for at least</span>
+          <input type="number" id="smartIdleThreshold" min="1" max="3600">
+          <span>seconds</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Power</div>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div>
+            <div>Keep system awake</div>
+            <div class="card-sub">Prevents sleep; the display can still turn off</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="keepSystemAwakeToggle">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="row" style="margin-top: 12px;">
+          <div>
+            <div>Keep display awake</div>
+            <div class="card-sub">Uses more battery — the screen never dims</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="keepDisplayAwakeToggle">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="row" style="margin-top: 14px;">
+          <div>Pause on low battery</div>
+          <label class="switch">
+            <input type="checkbox" id="pauseOnLowBatteryToggle">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="num-field" id="lowBatteryPercentRow" style="margin-top: 10px;">
+          <span>Below</span>
+          <input type="number" id="lowBatteryPercent" min="0" max="100">
+          <span>% and unplugged</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Global hotkey</div>
+          <div class="card-sub">Toggle Keep online from anywhere</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="hotkeyEnabledToggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="card-body" id="hotkeyBody">
+        <input type="text" id="hotkeyInput" placeholder="<ctrl>+<alt>+u">
+        <div class="error-text" id="hotkeyError">Invalid hotkey format.</div>
+        <div class="hint">Format is &lt;ctrl&gt;+&lt;alt&gt;+u style (pynput). On macOS this needs Accessibility permission.</div>
+      </div>
+    </div>
+
+    <div class="section-label">App trigger &amp; startup</div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">App trigger</div>
+          <div class="card-sub">Only active while a tracked app is running</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="appTriggerEnabledToggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="card-body" id="appTriggerBody">
+        <div class="chips" id="appTriggerChips">
+          <button class="chip" data-app="teams">Teams</button>
+          <button class="chip" data-app="slack">Slack</button>
+          <button class="chip" data-app="zoom">Zoom</button>
+          <button class="chip" data-app="webex">Webex</button>
+          <button class="chip" data-app="discord">Discord</button>
+        </div>
+        <div class="hint" style="margin-top: 10px;">Custom process names (comma-separated):</div>
+        <input type="text" id="appTriggerCustom" placeholder="e.g. myapp, another-app" style="margin-top: 6px;">
+        <div class="hint">Active while any selected app is running (checked about once a minute). Google Chat is web-based and can't be detected this way — leave it out and use working hours/manual toggle instead.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Start at login</div>
+          <div class="card-sub" id="autostartSub">Launch Unidle automatically</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="autostartToggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Profiles</div>
+      </div>
+      <div class="card-body">
+        <div id="profilesList"></div>
+        <div class="save-profile-row">
+          <input type="text" id="profileNameInput" placeholder="Profile name">
+          <button class="btn btn-secondary btn-small" id="saveProfileBtn">Save current</button>
+        </div>
+        <div class="error-text" id="profileNameError">Enter a name.</div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <div class="card-title">Activity</div>
@@ -595,9 +929,13 @@ _HTML = r"""
 <script>
 var DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 var INTERVAL_LABELS = {30: "30s", 60: "1m", 120: "2m", 300: "5m"};
+var ACTIVITY_MODE_LABELS = {f15: "F15 key", mouse: "mouse nudge", scroll: "scroll nudge"};
+var APP_LABELS = {teams: "Teams", slack: "Slack", zoom: "Zoom", webex: "Webex", discord: "Discord"};
+var HOTKEY_RE = /^(<[a-z0-9_]+>|[a-z0-9])(\+(<[a-z0-9_]+>|[a-z0-9]))*$/i;
 
 var original = null;
 var current = null;
+var runtimeInfo = { autostart_available: true, platform: "" };
 
 function deepEqual(a, b) {
   return JSON.stringify(sortedCopy(a)) === JSON.stringify(sortedCopy(b));
@@ -629,20 +967,29 @@ function jitterRange(interval) {
 }
 
 function buildSummary() {
-  if (!current.running) return "Paused — keypresses are off.";
+  if (!current.running) return "Paused — activity is off.";
   var parts = [];
   if (current.working_hours_enabled) {
     parts.push("Active " + summarizeDays(current.working_days) + ", " + current.working_hours_start + "–" + current.working_hours_end);
   } else {
     parts.push("Active anytime");
   }
-  var intervalText = "keypress every ~" + INTERVAL_LABELS[current.interval];
+  var intervalText = "every ~" + INTERVAL_LABELS[current.interval];
   if (current.randomize) {
-    intervalText = "keypress every ~" + jitterRange(current.interval);
+    intervalText = "every ~" + jitterRange(current.interval);
   }
   parts.push(intervalText);
+  if (current.activity_mode !== "f15") {
+    parts.push(ACTIVITY_MODE_LABELS[current.activity_mode] + " mode");
+  }
+  if (current.smart_idle) {
+    parts.push("smart idle " + current.smart_idle_threshold + "s");
+  }
   if (current.auto_stop_choice !== "Off") {
     parts.push("auto-stop " + current.auto_stop_choice);
+  }
+  if (current.app_trigger_enabled) {
+    parts.push("app trigger on");
   }
   return parts.join(" · ");
 }
@@ -657,7 +1004,14 @@ function validate() {
       errors.time = true;
     }
   }
+  if (current.hotkey_enabled && !HOTKEY_RE.test(current.hotkey || "")) {
+    errors.hotkey = true;
+  }
   return errors;
+}
+
+function markCustom() {
+  current.active_profile = null;
 }
 
 function render() {
@@ -685,15 +1039,137 @@ function render() {
   setSegmented("autoStopSegmented", current.auto_stop_choice);
   document.getElementById("notificationsToggle").checked = current.notifications_enabled;
 
+  setSegmented("activityModeSegmented", current.activity_mode);
+  document.getElementById("smartIdleToggle").checked = current.smart_idle;
+  document.getElementById("smartIdleThreshold").value = current.smart_idle_threshold;
+  document.getElementById("smartIdleThresholdRow").classList.toggle("dimmed", !current.smart_idle);
+
+  document.getElementById("keepSystemAwakeToggle").checked = current.keep_system_awake;
+  document.getElementById("keepDisplayAwakeToggle").checked = current.keep_display_awake;
+  document.getElementById("pauseOnLowBatteryToggle").checked = current.pause_on_low_battery;
+  document.getElementById("lowBatteryPercent").value = current.low_battery_percent;
+  document.getElementById("lowBatteryPercentRow").classList.toggle("dimmed", !current.pause_on_low_battery);
+
+  document.getElementById("hotkeyEnabledToggle").checked = current.hotkey_enabled;
+  document.getElementById("hotkeyInput").value = current.hotkey;
+  document.getElementById("hotkeyBody").classList.toggle("dimmed", !current.hotkey_enabled);
+
+  document.getElementById("appTriggerEnabledToggle").checked = current.app_trigger_enabled;
+  document.getElementById("appTriggerBody").classList.toggle("dimmed", !current.app_trigger_enabled);
+  document.querySelectorAll("#appTriggerChips .chip").forEach(function(chip) {
+    var app = chip.getAttribute("data-app");
+    chip.classList.toggle("active", current.app_trigger_apps.indexOf(app) !== -1);
+  });
+  document.getElementById("appTriggerCustom").value = current.app_trigger_custom.join(", ");
+
+  document.getElementById("autostartToggle").checked = current.autostart;
+  document.getElementById("autostartToggle").disabled = !runtimeInfo.autostart_available;
+  document.getElementById("autostartSub").textContent = runtimeInfo.autostart_available
+    ? "Launch Unidle automatically when you log in"
+    : "Only available in a built app (run build_windows.bat / build_macos.sh) — not from source";
+
+  renderProfiles();
+
   var errors = validate();
   document.getElementById("daysError").classList.toggle("show", !!errors.days);
   document.getElementById("timeError").classList.toggle("show", !!errors.time);
   document.getElementById("endTime").classList.toggle("invalid", !!errors.time);
+  document.getElementById("hotkeyError").classList.toggle("show", !!errors.hotkey);
+  document.getElementById("hotkeyInput").classList.toggle("invalid", !!errors.hotkey);
 
   var dirty = !deepEqual(current, original);
   var hasErrors = Object.keys(errors).length > 0;
   document.getElementById("saveBtn").disabled = !dirty || hasErrors;
   pywebview.api.notify_dirty(dirty);
+}
+
+function renderProfiles() {
+  var list = document.getElementById("profilesList");
+  list.innerHTML = "";
+  var names = Object.keys(current.profiles || {}).sort();
+  if (names.length === 0) {
+    var empty = document.createElement("div");
+    empty.className = "activity-empty";
+    empty.textContent = "No profiles saved yet.";
+    list.appendChild(empty);
+    return;
+  }
+  names.forEach(function(name) {
+    var row = document.createElement("div");
+    row.className = "profile-row";
+
+    var nameWrap = document.createElement("div");
+    nameWrap.className = "profile-name";
+    var nameSpan = document.createElement("span");
+    nameSpan.textContent = name;
+    nameWrap.appendChild(nameSpan);
+    if (current.active_profile === name) {
+      var badge = document.createElement("span");
+      badge.className = "profile-active-badge";
+      badge.textContent = "ACTIVE";
+      nameWrap.appendChild(badge);
+    }
+
+    var actions = document.createElement("div");
+    actions.className = "profile-actions";
+    var applyBtn = document.createElement("button");
+    applyBtn.className = "btn btn-secondary btn-small";
+    applyBtn.textContent = "Apply";
+    applyBtn.addEventListener("click", function() { applyProfile(name); });
+    var deleteBtn = document.createElement("button");
+    deleteBtn.className = "btn btn-danger-text btn-small";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.addEventListener("click", function() { confirmDeleteProfile(name); });
+    actions.appendChild(applyBtn);
+    actions.appendChild(deleteBtn);
+
+    row.appendChild(nameWrap);
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+function reloadFromDisk() {
+  pywebview.api.load().then(function(data) {
+    original = data;
+    current = JSON.parse(JSON.stringify(data));
+    render();
+  });
+}
+
+function applyProfile(name) {
+  pywebview.api.apply_profile(name).then(function(res) {
+    if (res.ok) reloadFromDisk();
+  });
+}
+
+function confirmDeleteProfile(name) {
+  showModal("deleteProfile", name);
+}
+
+function saveProfile() {
+  var nameInput = document.getElementById("profileNameInput");
+  var name = nameInput.value.trim();
+  var errorEl = document.getElementById("profileNameError");
+  if (!name) {
+    errorEl.classList.add("show");
+    return;
+  }
+  errorEl.classList.remove("show");
+  if (current.profiles && current.profiles[name]) {
+    showModal("overwriteProfile", name);
+    return;
+  }
+  doSaveProfile(name);
+}
+
+function doSaveProfile(name) {
+  pywebview.api.save_profile(name, current).then(function(res) {
+    if (res.ok) {
+      document.getElementById("profileNameInput").value = "";
+      reloadFromDisk();
+    }
+  });
 }
 
 function setSegmented(containerId, value) {
@@ -705,30 +1181,102 @@ function setSegmented(containerId, value) {
 function bindEvents() {
   document.getElementById("runningToggle").addEventListener("change", function(e) {
     current.running = e.target.checked;
+    markCustom();
     render();
   });
   document.getElementById("randomizeToggle").addEventListener("change", function(e) {
     current.randomize = e.target.checked;
+    markCustom();
     render();
   });
   document.getElementById("workingHoursToggle").addEventListener("change", function(e) {
     current.working_hours_enabled = e.target.checked;
+    markCustom();
     render();
   });
   document.getElementById("notificationsToggle").addEventListener("change", function(e) {
     current.notifications_enabled = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("smartIdleToggle").addEventListener("change", function(e) {
+    current.smart_idle = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("smartIdleThreshold").addEventListener("change", function(e) {
+    var v = parseInt(e.target.value, 10);
+    current.smart_idle_threshold = isNaN(v) ? 1 : Math.max(1, Math.min(3600, v));
+    markCustom();
+    render();
+  });
+  document.getElementById("keepSystemAwakeToggle").addEventListener("change", function(e) {
+    current.keep_system_awake = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("keepDisplayAwakeToggle").addEventListener("change", function(e) {
+    current.keep_display_awake = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("pauseOnLowBatteryToggle").addEventListener("change", function(e) {
+    current.pause_on_low_battery = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("lowBatteryPercent").addEventListener("change", function(e) {
+    var v = parseInt(e.target.value, 10);
+    current.low_battery_percent = isNaN(v) ? 0 : Math.max(0, Math.min(100, v));
+    markCustom();
+    render();
+  });
+  document.getElementById("hotkeyEnabledToggle").addEventListener("change", function(e) {
+    current.hotkey_enabled = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("hotkeyInput").addEventListener("change", function(e) {
+    current.hotkey = e.target.value.trim();
+    markCustom();
+    render();
+  });
+  document.getElementById("appTriggerEnabledToggle").addEventListener("change", function(e) {
+    current.app_trigger_enabled = e.target.checked;
+    markCustom();
+    render();
+  });
+  document.getElementById("appTriggerCustom").addEventListener("change", function(e) {
+    current.app_trigger_custom = e.target.value.split(",")
+      .map(function(s) { return s.trim(); })
+      .filter(function(s) { return s.length > 0; });
+    markCustom();
+    render();
+  });
+  document.getElementById("autostartToggle").addEventListener("change", function(e) {
+    current.autostart = e.target.checked;
+    markCustom();
     render();
   });
 
   document.querySelectorAll("#intervalSegmented button").forEach(function(btn) {
     btn.addEventListener("click", function() {
       current.interval = parseInt(btn.getAttribute("data-value"), 10);
+      markCustom();
       render();
     });
   });
   document.querySelectorAll("#autoStopSegmented button").forEach(function(btn) {
     btn.addEventListener("click", function() {
       current.auto_stop_choice = btn.getAttribute("data-value");
+      markCustom();
+      render();
+    });
+  });
+  document.querySelectorAll("#activityModeSegmented button").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      current.activity_mode = btn.getAttribute("data-value");
+      markCustom();
       render();
     });
   });
@@ -741,17 +1289,35 @@ function bindEvents() {
       } else {
         current.working_days.splice(idx, 1);
       }
+      markCustom();
+      render();
+    });
+  });
+  document.querySelectorAll("#appTriggerChips .chip").forEach(function(chip) {
+    chip.addEventListener("click", function() {
+      var app = chip.getAttribute("data-app");
+      var idx = current.app_trigger_apps.indexOf(app);
+      if (idx === -1) {
+        current.app_trigger_apps.push(app);
+      } else {
+        current.app_trigger_apps.splice(idx, 1);
+      }
+      markCustom();
       render();
     });
   });
   document.getElementById("startTime").addEventListener("change", function(e) {
     current.working_hours_start = e.target.value;
+    markCustom();
     render();
   });
   document.getElementById("endTime").addEventListener("change", function(e) {
     current.working_hours_end = e.target.value;
+    markCustom();
     render();
   });
+
+  document.getElementById("saveProfileBtn").addEventListener("click", saveProfile);
 
   document.getElementById("saveBtn").addEventListener("click", save);
   document.getElementById("cancelBtn").addEventListener("click", cancelOrClose);
@@ -802,7 +1368,7 @@ function cancelOrClose() {
   }
 }
 
-function showModal(type) {
+function showModal(type, payload) {
   var overlay = document.getElementById("modalOverlay");
   var title = document.getElementById("modalTitle");
   var body = document.getElementById("modalBody");
@@ -826,9 +1392,30 @@ function showModal(type) {
     primary.onclick = function() {
       hideModal();
       pywebview.api.defaults().then(function(defaults) {
-        current = defaults;
+        current = Object.assign({}, current, defaults);
+        markCustom();
         render();
       });
+    };
+  } else if (type === "deleteProfile") {
+    title.textContent = "Delete profile?";
+    body.textContent = 'Delete the profile "' + payload + '"? This can\'t be undone.';
+    secondary.textContent = "Cancel";
+    primary.textContent = "Delete";
+    primary.onclick = function() {
+      hideModal();
+      pywebview.api.delete_profile(payload).then(function(res) {
+        if (res.ok) reloadFromDisk();
+      });
+    };
+  } else if (type === "overwriteProfile") {
+    title.textContent = "Overwrite profile?";
+    body.textContent = 'A profile named "' + payload + '" already exists. Overwrite it with the current settings?';
+    secondary.textContent = "Cancel";
+    primary.textContent = "Overwrite";
+    primary.onclick = function() {
+      hideModal();
+      doSaveProfile(payload);
     };
   }
   secondary.onclick = hideModal;
@@ -903,6 +1490,10 @@ window.addEventListener("pywebviewready", function() {
   setupScrollShadow();
   pollActivity();
   setInterval(pollActivity, 5000);
+  pywebview.api.runtime_info().then(function(info) {
+    runtimeInfo = info;
+    render();
+  });
   pywebview.api.load().then(function(data) {
     original = data;
     current = JSON.parse(JSON.stringify(data));

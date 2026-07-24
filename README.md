@@ -6,17 +6,26 @@
 
 A small system tray / menu bar app that keeps **Microsoft Teams, Slack,
 Zoom, Webex — or anything else that watches OS idle time** — from flipping
-your status to "Away". It works by sending an invisible **F15** keypress
-on an interval — F15 has no effect on anything, it just resets the
-operating system's idle timer.
+your status to "Away". By default it works by sending an invisible **F15**
+keypress on an interval — F15 has no effect on anything, it just resets
+the operating system's idle timer. Mouse/scroll nudges are available as
+alternate activity modes if something in your environment filters
+synthetic key presses.
 
 Because every one of these apps reads the same OS idle timer, one
 mechanism covers them all: there is nothing to configure per app, and
 apps you install later are covered automatically.
 
 No API access to any of these services, no reading of your data, no
-credentials stored. It only ever does one thing: press a harmless key
-every so often.
+credentials stored. It only ever does one thing: send a harmless bit of
+activity every so often — and, with **Smart idle** on (the default), only
+when you're actually away.
+
+Unidle is also built to use close to no energy at idle: the worker thread
+sleeps until the next thing that could actually matter (the next
+scheduled activity, an auto-stop deadline, a working-hours edge) instead
+of waking up every second, and it pauses itself automatically when your
+screen is locked or your battery is low.
 
 ### Picking an interval
 
@@ -115,23 +124,75 @@ will build both the Windows `.exe` and macOS `.app` for you automatically
   you launch the app. Opening a second copy while one is already running
   just prints a message and exits immediately — it won't double up on
   tray icons or keypresses.
-- A small local activity log (toggles, auto-stop, working-hours changes —
-  no keystroke content, ever) is kept at `~/.unidle_log.jsonl` (capped to
-  the most recent 500 entries) plus a one-line `~/.unidle_last.json` with
-  the last keypress time. Both feed the Activity card in the Settings
-  window; delete them any time, they're regenerated as needed.
+- A small local activity log (toggles, auto-stop, working-hours changes,
+  lock/battery pauses — no keystroke content, ever) is kept at
+  `~/.unidle_log.jsonl` (capped to the most recent 500 entries) plus a
+  one-line `~/.unidle_last.json` with the last activity time. Both feed
+  the Activity card in the Settings window; delete them any time, they're
+  regenerated as needed.
+- **Profiles** — save the current settings as a named profile from the
+  Settings window, then switch between them from the tray's **Profiles**
+  submenu (e.g. a "Work" profile with working hours on, and an "OnCall"
+  profile with them off). Changing any setting after applying a profile
+  clears the active-profile marker — it's now a custom, unsaved mix.
 
 ## Settings window
 
 Pick **Settings…** from the tray menu (or double-click the tray icon) to
 open a small GUI window with everything in one place: the keep-online
 toggle, interval, randomize, working hours (days + start/end time),
-auto-stop, notifications, and an **Activity** card showing when the app
-last sent a keypress and a short history of recent events (toggles,
-auto-stop, entering/leaving working hours). A summary line updates live
-as you change values, and **Save** writes `~/.unidle.json` and applies
-the change to the running tray app within a couple of seconds — no
-restart needed.
+auto-stop, notifications, activity mode, power/energy options, a global
+hotkey, app-aware triggering, start-at-login, profiles, and an
+**Activity** card showing when the app last sent activity and a short
+history of recent events. A summary line updates live as you change
+values, and **Save** writes `~/.unidle.json` and applies the change to
+the running tray app within a couple of seconds — no restart needed.
+
+### Activity mode and smart idle
+
+- **Activity mode** — `F15 key` (default, invisible everywhere), `Mouse`
+  (nudges the cursor 1px and back), or `Scroll` (scrolls one unit and
+  back). Only switch off F15 if something in your setup actually filters
+  synthetic key events.
+- **Smart idle** (on by default) — only sends activity once you've
+  actually been away for a configurable number of seconds, instead of
+  sending on a fixed clock regardless of whether you're at the keyboard.
+  This also keeps the activity log meaningfully sparse.
+
+### Power options
+
+- **Keep system awake** — in addition to the periodic activity, actively
+  tells the OS not to sleep (`SetThreadExecutionState` on Windows,
+  `caffeinate -i` on macOS). The display can still turn off.
+- **Keep display awake** — the stronger version: the screen never dims
+  or turns off either. Uses more battery — off by default, and the
+  Settings window says so.
+- **Pause on low battery** (on by default, 20%) — automatically pauses
+  when unplugged and below the threshold, and resumes once you plug in
+  or charge back up past it (with a small buffer so it doesn't flap
+  right at the threshold).
+
+### Global hotkey
+
+Optionally bind a global hotkey (default `<ctrl>+<alt>+u`, off by
+default) to toggle Keep online from anywhere, using
+[pynput's `GlobalHotKeys` format](https://pynput.readthedocs.io/en/latest/keyboard.html#global-hotkeys).
+On macOS this needs the same Accessibility permission as sending
+activity.
+
+### App-aware trigger
+
+Optionally restrict activity to times when a tracked app (Teams, Slack,
+Zoom, Webex, Discord, or your own custom process names) is actually
+running — checked about once a minute so it doesn't add wake-ups. Google
+Chat is web-based and can't be detected this way.
+
+### Start at login
+
+Launches Unidle automatically when you log in (Windows: a `Run` registry
+value; macOS: a `LaunchAgent`). Only available in a **built** app — from
+source, `sys.executable` is the Python interpreter, not something worth
+auto-starting, so the toggle is disabled with an explanation.
 
 The window runs as a separate process from the tray app (this keeps
 `pywebview` off the tray app's own thread, which matters on macOS), so

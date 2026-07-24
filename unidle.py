@@ -1,10 +1,11 @@
 """Unidle — keeps Microsoft Teams (or any app) from going idle.
 
-Sends an invisible F15 keypress on an interval to reset the OS idle timer.
-Lives entirely in the system tray/menu bar. No credentials, no network,
-no interaction with Teams itself.
+Sends an invisible F15 keypress (or a mouse/scroll nudge) on an interval to
+reset the OS idle timer. Lives entirely in the system tray/menu bar. No
+credentials, no network, no interaction with the tracked apps themselves.
 """
 
+import ctypes
 import json
 import os
 import random
@@ -13,11 +14,13 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import psutil
 from PIL import Image, ImageDraw
 import pystray
-from pynput.keyboard import Controller, Key
+from pynput.keyboard import Controller, GlobalHotKeys, HotKey, Key
+from pynput.mouse import Controller as MouseController
 
 # ---------------------------------------------------------------------------
 # Config — edit these to change defaults. Everything here is a plain
@@ -33,7 +36,7 @@ LOG_MAX_LINES = 500
 LOG_TRUNCATE_CHECK_INTERVAL = 100  # only check/truncate every N appends; cheap
 SINGLE_INSTANCE_PORT = 58731  # localhost-only mutex; OS frees it if we crash
 
-DEFAULT_INTERVAL = 60  # seconds between keypresses
+DEFAULT_INTERVAL = 60  # seconds between activity sends
 INTERVAL_CHOICES = [30, 60, 120, 300]  # 30s / 1min / 2min / 5min
 
 RANDOMIZE_DEFAULT = True
@@ -49,7 +52,49 @@ AUTO_STOP_DEFAULT = "Off"
 
 NOTIFICATIONS_DEFAULT = False
 
-TICK_SECONDS = 1  # worker loop resolution; lets toggles/interval react fast
+ACTIVITY_MODES = ("f15", "mouse", "scroll")
+ACTIVITY_MODE_DEFAULT = "f15"
+
+SMART_IDLE_DEFAULT = True
+SMART_IDLE_THRESHOLD_DEFAULT = 30
+
+KEEP_SYSTEM_AWAKE_DEFAULT = False
+KEEP_DISPLAY_AWAKE_DEFAULT = False
+
+PAUSE_ON_LOW_BATTERY_DEFAULT = True
+LOW_BATTERY_PERCENT_DEFAULT = 20
+
+HOTKEY_ENABLED_DEFAULT = False
+HOTKEY_DEFAULT = "<ctrl>+<alt>+u"
+
+APP_TRIGGER_ENABLED_DEFAULT = False
+APP_TRIGGER_APPS_DEFAULT = ["teams"]
+APP_TRIGGER_CUSTOM_DEFAULT = []
+APP_TRIGGER_IDS = ("teams", "slack", "zoom", "webex", "discord", "gchat")
+
+# preset id -> substrings matched case-insensitively against process names
+# (psutil.process_iter(['name'])). "gchat" is web-based and can't be
+# detected this way; it's listed so the UI can say so explicitly.
+APP_PROCESS_PRESETS = {
+    "teams": ["ms-teams", "teams"],
+    "slack": ["slack"],
+    "zoom": ["zoom", "cptHost".lower()],
+    "webex": ["webex", "ciscocollabhost"],
+    "discord": ["discord"],
+    "gchat": [],
+}
+
+AUTOSTART_DEFAULT = False
+
+AUTO_START_TICK_SECONDS = 1  # kept only as the Settings-window-open poll interval
+
+SETTINGS_POLL_SECONDS = 1  # worker wakes at this cadence only while Settings is open
+MAX_SLEEP_SECONDS = 300  # safety fallback so a missed wake() self-heals quickly
+LOCK_RECHECK_SECONDS = 3
+BATTERY_RECHECK_SECONDS = 60
+BATTERY_HYSTERESIS_PERCENT = 5
+APP_TRIGGER_CACHE_SECONDS = 60
+
 ICON_SIZE = 64  # rendered large then downsampled for crisp HiDPI icons
 
 SETTINGS_KEYS = (
@@ -62,7 +107,28 @@ SETTINGS_KEYS = (
     "working_days",
     "auto_stop_choice",
     "notifications_enabled",
+    # Phase 1 (PLAN-5)
+    "activity_mode",
+    "smart_idle",
+    "smart_idle_threshold",
+    "keep_system_awake",
+    "keep_display_awake",
+    "pause_on_low_battery",
+    "low_battery_percent",
+    "hotkey_enabled",
+    "hotkey",
+    # Phase 2 (PLAN-5)
+    "app_trigger_enabled",
+    "app_trigger_apps",
+    "app_trigger_custom",
+    "autostart",
+    "profiles",
+    "active_profile",
 )
+
+# Keys captured when saving a profile snapshot — everything except the
+# profile bookkeeping keys themselves (a profile must never nest "profiles").
+PROFILE_KEYS = tuple(k for k in SETTINGS_KEYS if k not in ("profiles", "active_profile"))
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +146,21 @@ def default_settings():
         "working_days": sorted(WORKING_DAYS),
         "auto_stop_choice": AUTO_STOP_DEFAULT,
         "notifications_enabled": NOTIFICATIONS_DEFAULT,
+        "activity_mode": ACTIVITY_MODE_DEFAULT,
+        "smart_idle": SMART_IDLE_DEFAULT,
+        "smart_idle_threshold": SMART_IDLE_THRESHOLD_DEFAULT,
+        "keep_system_awake": KEEP_SYSTEM_AWAKE_DEFAULT,
+        "keep_display_awake": KEEP_DISPLAY_AWAKE_DEFAULT,
+        "pause_on_low_battery": PAUSE_ON_LOW_BATTERY_DEFAULT,
+        "low_battery_percent": LOW_BATTERY_PERCENT_DEFAULT,
+        "hotkey_enabled": HOTKEY_ENABLED_DEFAULT,
+        "hotkey": HOTKEY_DEFAULT,
+        "app_trigger_enabled": APP_TRIGGER_ENABLED_DEFAULT,
+        "app_trigger_apps": list(APP_TRIGGER_APPS_DEFAULT),
+        "app_trigger_custom": list(APP_TRIGGER_CUSTOM_DEFAULT),
+        "autostart": AUTOSTART_DEFAULT,
+        "profiles": {},
+        "active_profile": None,
     }
 
 
@@ -98,6 +179,34 @@ def _is_valid_days(value):
         isinstance(value, list)
         and len(value) > 0
         and all(isinstance(d, int) and 0 <= d <= 6 for d in value)
+    )
+
+
+def _is_valid_percent(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
+
+
+def _is_valid_hotkey(value):
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        HotKey.parse(value)
+        return True
+    except Exception:
+        return False
+
+
+def _is_valid_string_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_valid_app_trigger_apps(value):
+    return isinstance(value, list) and all(isinstance(v, str) and v in APP_TRIGGER_IDS for v in value)
+
+
+def _is_valid_profiles(value):
+    return isinstance(value, dict) and all(
+        isinstance(k, str) and isinstance(v, dict) for k, v in value.items()
     )
 
 
@@ -121,6 +230,36 @@ def load_settings():
             settings["working_hours_end"] = WORKING_HOURS_END
         if not _is_valid_days(settings["working_days"]):
             settings["working_days"] = sorted(WORKING_DAYS)
+        if settings["activity_mode"] not in ACTIVITY_MODES:
+            settings["activity_mode"] = ACTIVITY_MODE_DEFAULT
+        if not isinstance(settings["smart_idle"], bool):
+            settings["smart_idle"] = SMART_IDLE_DEFAULT
+        if not _is_valid_percent(settings["smart_idle_threshold"]) or settings["smart_idle_threshold"] < 1:
+            settings["smart_idle_threshold"] = SMART_IDLE_THRESHOLD_DEFAULT
+        if not isinstance(settings["keep_system_awake"], bool):
+            settings["keep_system_awake"] = KEEP_SYSTEM_AWAKE_DEFAULT
+        if not isinstance(settings["keep_display_awake"], bool):
+            settings["keep_display_awake"] = KEEP_DISPLAY_AWAKE_DEFAULT
+        if not isinstance(settings["pause_on_low_battery"], bool):
+            settings["pause_on_low_battery"] = PAUSE_ON_LOW_BATTERY_DEFAULT
+        if not _is_valid_percent(settings["low_battery_percent"]):
+            settings["low_battery_percent"] = LOW_BATTERY_PERCENT_DEFAULT
+        if not isinstance(settings["hotkey_enabled"], bool):
+            settings["hotkey_enabled"] = HOTKEY_ENABLED_DEFAULT
+        if not _is_valid_hotkey(settings["hotkey"]):
+            settings["hotkey"] = HOTKEY_DEFAULT
+        if not isinstance(settings["app_trigger_enabled"], bool):
+            settings["app_trigger_enabled"] = APP_TRIGGER_ENABLED_DEFAULT
+        if not _is_valid_app_trigger_apps(settings["app_trigger_apps"]):
+            settings["app_trigger_apps"] = list(APP_TRIGGER_APPS_DEFAULT)
+        if not _is_valid_string_list(settings["app_trigger_custom"]):
+            settings["app_trigger_custom"] = list(APP_TRIGGER_CUSTOM_DEFAULT)
+        if not isinstance(settings["autostart"], bool):
+            settings["autostart"] = AUTOSTART_DEFAULT
+        if not _is_valid_profiles(settings["profiles"]):
+            settings["profiles"] = {}
+        if settings["active_profile"] is not None and settings["active_profile"] not in settings["profiles"]:
+            settings["active_profile"] = None
     except Exception:
         pass
     return settings, first_run
@@ -142,6 +281,10 @@ def _config_mtime():
         return os.path.getmtime(CONFIG_PATH)
     except OSError:
         return None
+
+
+def is_frozen():
+    return getattr(sys, "frozen", False)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +390,35 @@ def acquire_single_instance():
     return True
 
 
+def show_already_running_alert():
+    """Best-effort feedback when a second instance is launched.
+
+    There is no tray icon in this short-lived process to call notify() on,
+    so this falls back straight to a native alert (MessageBox on Windows,
+    osascript on macOS) — the point is that double-clicking the exe a
+    second time must never be silently swallowed.
+    """
+    try:
+        if sys.platform == "win32":
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"{APP_NAME} is already running in the tray.",
+                APP_NAME,
+                0x40,  # MB_ICONINFORMATION
+            )
+        elif sys.platform == "darwin":
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display alert "{APP_NAME}" message "{APP_NAME} is already running in the tray."',
+                ],
+                capture_output=True,
+            )
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Working hours
 # ---------------------------------------------------------------------------
@@ -260,14 +432,38 @@ def is_within_working_hours(start, end, days, now=None):
     return start_t <= now.time() <= end_t
 
 
+def seconds_until_next_working_hours_edge(start, end, days, now):
+    """Seconds until the next entry/exit boundary of the working-hours
+    window, looked ahead up to 8 days (always finds one — `days` is
+    validated non-empty). Used so the adaptive scheduler can wake exactly
+    when a working-hours transition happens instead of polling for it."""
+    start_t = datetime.strptime(start, "%H:%M").time()
+    end_t = datetime.strptime(end, "%H:%M").time()
+    for add_days in range(0, 8):
+        day = now + timedelta(days=add_days)
+        if day.weekday() not in days:
+            continue
+        for edge in sorted((datetime.combine(day.date(), start_t), datetime.combine(day.date(), end_t))):
+            if edge > now:
+                return (edge - now).total_seconds()
+    return 3600.0
+
+
 # ---------------------------------------------------------------------------
 # Icon drawing
 #
-# Three distinct states, drawn as simple presence-style dots so they read
-# at 16-22px: ON = solid green, OFF = hollow gray ring, outside working
-# hours = gray dot with a small clock badge. A light outline keeps them
-# visible on both light and dark tray/menu-bar backgrounds.
+# Distinct states, drawn as simple presence-style dots so they read at
+# 16-22px: ON = solid green, OFF = hollow gray ring, everything else
+# ("outside working hours", locked, low battery, waiting for a tracked
+# app) = gray dot with a small clock badge — they're all "temporarily not
+# sending" for a reason visible in the status text/title, so they share
+# one icon to avoid a wall of near-identical badge variants. A light
+# outline keeps them visible on both light and dark tray/menu-bar
+# backgrounds.
 # ---------------------------------------------------------------------------
+
+PAUSED_STATUSES = ("outside_hours", "lock_paused", "battery_paused", "waiting_app")
+
 
 def _dot(draw, color, outline, fill=True, width=4):
     cx = cy = ICON_SIZE / 2
@@ -280,14 +476,14 @@ def _dot(draw, color, outline, fill=True, width=4):
 
 
 def build_icon_image(status):
-    """status: 'on' | 'off' | 'outside_hours'"""
+    """status: 'on' | 'off' | one of PAUSED_STATUSES"""
     img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     soft_outline = (255, 255, 255, 190)
 
     if status == "on":
         _dot(draw, (46, 204, 113, 255), soft_outline)
-    elif status == "outside_hours":
+    elif status in PAUSED_STATUSES:
         _dot(draw, (149, 165, 166, 255), soft_outline)
         bx = by = ICON_SIZE * 0.70
         br = ICON_SIZE * 0.22
@@ -389,7 +585,291 @@ def setup_macos_double_click(icon, app):
 
 
 # ---------------------------------------------------------------------------
-# Worker thread — sends the keepalive keypress
+# Platform layer — idle time, session lock, battery, prevent-sleep.
+#
+# Every function here is wrapped in try/except and feature-detects its
+# platform: on an unsupported OS/API it returns a safe "don't block
+# anything" value rather than crashing. Idle detection failing returns
+# None (meaning "assume idle", i.e. the old always-send behavior); lock
+# detection failing returns False (assume unlocked, i.e. don't block).
+# ---------------------------------------------------------------------------
+
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def _get_idle_seconds_windows():
+    try:
+        info = _LastInputInfo()
+        info.cbSize = ctypes.sizeof(_LastInputInfo)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        millis = ctypes.windll.kernel32.GetTickCount() - info.dwTime
+        return max(0.0, millis / 1000.0)
+    except Exception:
+        return None
+
+
+def _get_idle_seconds_macos():
+    try:
+        import Quartz
+
+        return Quartz.CGEventSourceSecondsSinceLastEventType(
+            Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType
+        )
+    except Exception:
+        return None
+
+
+def get_user_idle_seconds():
+    """Seconds since the last real input event, or None if unknown/unsupported."""
+    if sys.platform == "win32":
+        return _get_idle_seconds_windows()
+    if sys.platform == "darwin":
+        return _get_idle_seconds_macos()
+    return None
+
+
+def _is_locked_windows():
+    try:
+        # The lock/login screen runs on a separate, non-interactive desktop;
+        # OpenInputDesktop only succeeds when the current session's desktop
+        # is the one receiving input, i.e. when it's unlocked.
+        desktop = ctypes.windll.user32.OpenInputDesktop(0, False, 0)
+        if desktop:
+            ctypes.windll.user32.CloseDesktop(desktop)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _is_locked_macos():
+    try:
+        import Quartz
+
+        info = Quartz.CGSessionCopyCurrentDictionary()
+        if not info:
+            return False
+        return bool(info.get("CGSSessionScreenIsLocked", False))
+    except Exception:
+        return False
+
+
+def is_session_locked():
+    if sys.platform == "win32":
+        return _is_locked_windows()
+    if sys.platform == "darwin":
+        return _is_locked_macos()
+    return False
+
+
+def get_battery_status():
+    """Returns (percent, plugged_in) or None (desktop / no battery / unsupported)."""
+    try:
+        battery = psutil.sensors_battery()
+        if battery is None:
+            return None
+        return (battery.percent, battery.power_plugged)
+    except Exception:
+        return None
+
+
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _set_sleep_prevention_windows(system, display):
+    try:
+        flags = _ES_CONTINUOUS
+        if system or display:
+            flags |= _ES_SYSTEM_REQUIRED
+        if display:
+            flags |= _ES_DISPLAY_REQUIRED
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception:
+        pass
+
+
+_mac_caffeinate = {"proc": None, "mode": None}
+
+
+def _set_sleep_prevention_macos(system, display):
+    if display:
+        mode, args = "display", ["caffeinate", "-di"]
+    elif system:
+        mode, args = "system", ["caffeinate", "-i"]
+    else:
+        mode, args = None, None
+
+    if _mac_caffeinate["mode"] == mode:
+        return
+
+    old_proc = _mac_caffeinate["proc"]
+    if old_proc is not None:
+        try:
+            old_proc.terminate()
+        except Exception:
+            pass
+
+    new_proc = None
+    if args is not None:
+        try:
+            new_proc = subprocess.Popen(args)
+        except Exception:
+            new_proc = None
+
+    _mac_caffeinate["proc"] = new_proc
+    _mac_caffeinate["mode"] = mode
+
+
+def set_sleep_prevention(system, display):
+    """Must always be called from the same thread (the worker thread) —
+    SetThreadExecutionState is a per-thread API on Windows."""
+    try:
+        if sys.platform == "win32":
+            _set_sleep_prevention_windows(system, display)
+        elif sys.platform == "darwin":
+            _set_sleep_prevention_macos(system, display)
+    except Exception:
+        pass
+
+
+def is_any_tracked_app_running(app_ids, custom_names):
+    """OR match: True if any preset app or custom process name substring is
+    found among running processes. Fails open (returns True, i.e. don't
+    block sending) if the process list can't be read at all."""
+    needles = []
+    for app_id in app_ids:
+        needles.extend(APP_PROCESS_PRESETS.get(app_id, []))
+    needles.extend(n.strip().lower() for n in custom_names if n and n.strip())
+    if not needles:
+        return False
+    try:
+        for proc in psutil.process_iter(["name"]):
+            name = (proc.info.get("name") or "").lower()
+            if any(needle in name for needle in needles):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+_AUTOSTART_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = APP_NAME
+_LAUNCH_AGENT_LABEL = "com.unidle.app"
+
+
+def _launch_agent_path():
+    return os.path.join(os.path.expanduser("~/Library/LaunchAgents"), f"{_LAUNCH_AGENT_LABEL}.plist")
+
+
+def _set_autostart_windows(enabled):
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _AUTOSTART_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, sys.executable)
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+    except Exception:
+        pass
+
+
+def _set_autostart_macos(enabled):
+    path = _launch_agent_path()
+    try:
+        if enabled:
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0">\n<dict>\n'
+                f"    <key>Label</key><string>{_LAUNCH_AGENT_LABEL}</string>\n"
+                f"    <key>ProgramArguments</key><array><string>{sys.executable}</string></array>\n"
+                "    <key>RunAtLoad</key><true/>\n"
+                "</dict>\n</plist>\n"
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(plist)
+            subprocess.run(["launchctl", "load", path], capture_output=True)
+        elif os.path.exists(path):
+            subprocess.run(["launchctl", "unload", path], capture_output=True)
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def set_autostart(enabled):
+    """Only meaningful for a frozen (PyInstaller) build — from source,
+    sys.executable is the interpreter, not the app, so callers must gate
+    this on is_frozen()."""
+    try:
+        if sys.platform == "win32":
+            _set_autostart_windows(enabled)
+        elif sys.platform == "darwin":
+            _set_autostart_macos(enabled)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Global hotkey — separate listener thread (managed by pynput), started
+# only when enabled. Feature-detects hotkey-string parse failures and
+# permission issues (macOS Accessibility) by just not starting, silently.
+# ---------------------------------------------------------------------------
+
+class HotkeyListener:
+    def __init__(self, on_trigger):
+        self._on_trigger = on_trigger
+        self._listener = None
+        self._current_hotkey = None
+
+    def apply(self, enabled, hotkey):
+        if not enabled:
+            self.stop()
+            return
+        if self._listener is not None and self._current_hotkey == hotkey:
+            return  # already running with this exact binding
+        self.stop()
+        try:
+            self._listener = GlobalHotKeys({hotkey: self._on_trigger})
+            self._listener.start()
+            self._current_hotkey = hotkey
+        except Exception:
+            self._listener = None
+            self._current_hotkey = None
+            log_event("hotkey_error", detail=hotkey)
+
+    def stop(self):
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        self._listener = None
+        self._current_hotkey = None
+
+
+# ---------------------------------------------------------------------------
+# Worker thread — sends the keepalive activity on an adaptive schedule.
+#
+# Instead of ticking every second, the loop sleeps on an Event until the
+# next thing that could matter: the next scheduled activity, an auto-stop
+# deadline, a working-hours boundary, a pause-state recheck (lock/battery/
+# app-trigger/smart-idle), or — only while the Settings window is open —
+# a 1s poll so hot-reload still feels instant while the user is editing.
+# Any code path that changes state calls wake() (via UnidleApp.save()) so
+# toggles/interval changes take effect immediately instead of waiting for
+# the next natural wake.
 # ---------------------------------------------------------------------------
 
 class Worker(threading.Thread):
@@ -397,35 +877,221 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.app = app
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._next_press_at = 0.0
         self._keyboard = Controller()
+        self._mouse = None
+
+        self._lock_paused = False
+        self._battery_paused = False
+        self._app_trigger_active = True
+        self._app_trigger_cache_ts = None
+        self._app_trigger_cache_result = True
+
+        self._last_own_activity_ts = None
+        self._true_idle_anchor = None
+
+        self._sleep_prevention_applied = (False, False)
+
         self.reschedule()
 
+    # -- public, read by UnidleApp for status text -------------------------------------------------
+    @property
+    def lock_paused(self):
+        return self._lock_paused
+
+    @property
+    def battery_paused(self):
+        return self._battery_paused
+
+    @property
+    def app_trigger_active(self):
+        return self._app_trigger_active
+
+    # -- main loop -------------------------------------------------
     def run(self):
         while not self._stop_event.is_set():
-            self._stop_event.wait(TICK_SECONDS)
+            self.app.check_config_reload()
             if self._stop_event.is_set():
                 break
-            self.app.check_config_reload()
             self.app.check_auto_stop()
             self.app.check_working_hours_transition()
-            if not self._should_send():
-                continue
-            if time.time() >= self._next_press_at:
-                self._send_keypress()
+
+            now = time.time()
+            should_send, recheck_hint = self._should_send(now)
+            self._apply_sleep_prevention()
+            if should_send and now >= self._next_press_at:
+                self._send_activity()
                 self.reschedule()
 
-    def _should_send(self):
+            next_wake = self._compute_next_wake(time.time(), recheck_hint)
+            timeout = max(0.0, next_wake - time.time())
+            self._wake_event.wait(timeout)
+            self._wake_event.clear()
+
+        # Cleanup must happen on this thread: SetThreadExecutionState is
+        # per-thread on Windows, so releasing it from any other thread
+        # would be a no-op (or worse, affect the wrong thread's state).
+        try:
+            set_sleep_prevention(False, False)
+        except Exception:
+            pass
+
+    def wake(self):
+        self._wake_event.set()
+
+    def stop(self):
+        self._stop_event.set()
+        self._wake_event.set()
+
+    # -- gating logic -------------------------------------------------
+    def _should_send(self, now):
+        """Returns (should_send, recheck_after_seconds_or_None)."""
         state = self.app.state
         with state.lock:
-            if not state.running:
-                return False
-            if state.working_hours_enabled and not is_within_working_hours(
-                state.working_hours_start, state.working_hours_end, state.working_days
-            ):
-                return False
-        return True
+            running = state.running
+            wh_enabled = state.working_hours_enabled
+            wh_start = state.working_hours_start
+            wh_end = state.working_hours_end
+            wh_days = state.working_days
+            smart_idle = state.smart_idle
+            smart_idle_threshold = state.smart_idle_threshold
+            pause_on_low_battery = state.pause_on_low_battery
+            low_battery_percent = state.low_battery_percent
+            app_trigger_enabled = state.app_trigger_enabled
+            app_trigger_apps = list(state.app_trigger_apps)
+            app_trigger_custom = list(state.app_trigger_custom)
 
+        if not running:
+            return False, None
+
+        if wh_enabled and not is_within_working_hours(wh_start, wh_end, wh_days, datetime.now()):
+            return False, None  # recheck comes from the wh-edge candidate in _compute_next_wake
+
+        locked = is_session_locked()
+        if locked != self._lock_paused:
+            self._lock_paused = locked
+            log_event("lock_pause" if locked else "unlock_resume")
+        if locked:
+            return False, LOCK_RECHECK_SECONDS
+
+        if pause_on_low_battery:
+            battery = get_battery_status()
+            if battery is not None:
+                percent, plugged = battery
+                if plugged:
+                    paused = False
+                elif self._battery_paused:
+                    paused = percent < low_battery_percent + BATTERY_HYSTERESIS_PERCENT
+                else:
+                    paused = percent < low_battery_percent
+                if paused != self._battery_paused:
+                    self._battery_paused = paused
+                    if paused:
+                        log_event("battery_pause", detail=f"{percent}%")
+                        self.app.notify(f"Battery low ({percent}%) — keep-online paused.")
+                    else:
+                        log_event("battery_resume")
+                        self.app.notify("Battery okay — keep-online resumed.")
+                if paused:
+                    return False, BATTERY_RECHECK_SECONDS
+            elif self._battery_paused:
+                self._battery_paused = False
+
+        if app_trigger_enabled:
+            now_ts = time.time()
+            if (
+                self._app_trigger_cache_ts is None
+                or now_ts - self._app_trigger_cache_ts >= APP_TRIGGER_CACHE_SECONDS
+            ):
+                self._app_trigger_cache_result = is_any_tracked_app_running(
+                    app_trigger_apps, app_trigger_custom
+                )
+                self._app_trigger_cache_ts = now_ts
+            self._app_trigger_active = self._app_trigger_cache_result
+            if not self._app_trigger_active:
+                recheck = APP_TRIGGER_CACHE_SECONDS - (now_ts - self._app_trigger_cache_ts)
+                return False, max(1.0, recheck)
+        else:
+            self._app_trigger_active = True
+
+        if smart_idle:
+            effective_idle = self._effective_idle_seconds(now)
+            if effective_idle is not None and effective_idle < smart_idle_threshold:
+                return False, smart_idle_threshold - effective_idle
+
+        return True, None
+
+    def _effective_idle_seconds(self, now):
+        """Seconds since the last *real* human input — compensated so our
+        own synthetic activity doesn't reset it and make smart_idle think
+        the user is perpetually active. We track the most recent moment we
+        know a real human touched the machine (``_true_idle_anchor``): if
+        the OS-reported idle time is shorter than the time since our last
+        send, some newer event (necessarily human) reset it and we advance
+        the anchor; otherwise nothing has touched the machine since our own
+        send and the anchor is left alone."""
+        os_idle = get_user_idle_seconds()
+        if os_idle is None:
+            return None
+        since_our_send = (
+            now - self._last_own_activity_ts if self._last_own_activity_ts is not None else None
+        )
+        if since_our_send is None or os_idle < since_our_send - 1.0:
+            self._true_idle_anchor = now - os_idle
+        if self._true_idle_anchor is None:
+            return os_idle
+        return now - self._true_idle_anchor
+
+    def _apply_sleep_prevention(self):
+        state = self.app.state
+        with state.lock:
+            keep_system = state.keep_system_awake
+            keep_display = state.keep_display_awake
+            running = state.running
+            wh_enabled = state.working_hours_enabled
+            wh_start = state.working_hours_start
+            wh_end = state.working_hours_end
+            wh_days = state.working_days
+            app_trigger_enabled = state.app_trigger_enabled
+
+        within_hours = (not wh_enabled) or is_within_working_hours(wh_start, wh_end, wh_days)
+        app_ok = (not app_trigger_enabled) or self._app_trigger_active
+        active = running and within_hours and app_ok and not self._lock_paused and not self._battery_paused
+
+        want_system = active and (keep_system or keep_display)
+        want_display = active and keep_display
+        desired = (want_system, want_display)
+        if desired != self._sleep_prevention_applied:
+            set_sleep_prevention(want_system, want_display)
+            self._sleep_prevention_applied = desired
+
+    def _compute_next_wake(self, now, recheck_hint):
+        candidates = [now + MAX_SLEEP_SECONDS, self._next_press_at]
+
+        if self.app.settings_window_open():
+            candidates.append(now + SETTINGS_POLL_SECONDS)
+
+        with self.app.state.lock:
+            auto_stop_deadline = self.app.state.auto_stop_deadline
+            running = self.app.state.running
+            wh_enabled = self.app.state.working_hours_enabled
+            wh_start = self.app.state.working_hours_start
+            wh_end = self.app.state.working_hours_end
+            wh_days = self.app.state.working_days
+
+        if auto_stop_deadline:
+            candidates.append(auto_stop_deadline)
+        if running and wh_enabled:
+            candidates.append(
+                now + seconds_until_next_working_hours_edge(wh_start, wh_end, wh_days, datetime.now())
+            )
+        if recheck_hint is not None:
+            candidates.append(now + recheck_hint)
+
+        return max(now, min(candidates))
+
+    # -- scheduling / sending -------------------------------------------------
     def reschedule(self):
         state = self.app.state
         with state.lock:
@@ -436,21 +1102,45 @@ class Worker(threading.Thread):
             interval = random.uniform(max(1.0, interval - jitter), interval + jitter)
         self._next_press_at = time.time() + max(1.0, interval)
 
-    def _send_keypress(self):
+    def _send_activity(self):
+        state = self.app.state
+        with state.lock:
+            mode = state.activity_mode
         try:
-            self._keyboard.press(Key.f15)
-            self._keyboard.release(Key.f15)
+            if mode == "mouse":
+                self._send_mouse_nudge()
+            elif mode == "scroll":
+                self._send_scroll_nudge()
+            else:
+                self._keyboard.press(Key.f15)
+                self._keyboard.release(Key.f15)
         except Exception:
             return
-        with self.app.state.lock:
-            first_since_resume = self.app.state.last_keypress_time is None
-            self.app.state.last_keypress_time = time.time()
+
+        now = time.time()
+        self._last_own_activity_ts = now
+        with state.lock:
+            first_since_resume = state.last_keypress_time is None
+            state.last_keypress_time = now
         write_last_keypress()
         if first_since_resume:
-            log_event("keypress")
+            log_event("activity")
 
-    def stop(self):
-        self._stop_event.set()
+    def _get_mouse(self):
+        if self._mouse is None:
+            self._mouse = MouseController()
+        return self._mouse
+
+    def _send_mouse_nudge(self):
+        mouse = self._get_mouse()
+        x, y = mouse.position
+        mouse.position = (x + 1, y)
+        mouse.position = (x, y)
+
+    def _send_scroll_nudge(self):
+        mouse = self._get_mouse()
+        mouse.scroll(0, 1)
+        mouse.scroll(0, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -460,15 +1150,8 @@ class Worker(threading.Thread):
 class AppState:
     def __init__(self, settings):
         self.lock = threading.RLock()
-        self.running = settings["running"]
-        self.interval = settings["interval"]
-        self.randomize = settings["randomize"]
-        self.working_hours_enabled = settings["working_hours_enabled"]
-        self.working_hours_start = settings["working_hours_start"]
-        self.working_hours_end = settings["working_hours_end"]
-        self.working_days = settings["working_days"]
-        self.auto_stop_choice = settings["auto_stop_choice"]
-        self.notifications_enabled = settings["notifications_enabled"]
+        for key in SETTINGS_KEYS:
+            setattr(self, key, settings[key])
 
         self.start_time = time.time() if self.running else None
         self.last_keypress_time = None
@@ -480,17 +1163,7 @@ class AppState:
         self.auto_stop_deadline = time.time() + secs if (self.running and secs) else None
 
     def as_dict(self):
-        return {
-            "running": self.running,
-            "interval": self.interval,
-            "randomize": self.randomize,
-            "working_hours_enabled": self.working_hours_enabled,
-            "working_hours_start": self.working_hours_start,
-            "working_hours_end": self.working_hours_end,
-            "working_days": self.working_days,
-            "auto_stop_choice": self.auto_stop_choice,
-            "notifications_enabled": self.notifications_enabled,
-        }
+        return {key: getattr(self, key) for key in SETTINGS_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +1175,7 @@ class UnidleApp:
         self.state = AppState(settings)
         self.first_run = first_run
         self.worker = Worker(self)
+        self.hotkey_listener = HotkeyListener(self._on_hotkey_triggered)
         self.icon = pystray.Icon(APP_NAME, menu=self.build_menu())
         self.icon.icon = self._current_icon_image()
         self.icon.title = APP_NAME
@@ -513,12 +1187,16 @@ class UnidleApp:
     def save(self):
         save_settings(self.state.as_dict())
         self._last_config_mtime = _config_mtime()
+        self.worker.wake()
 
     # -- settings window / hot-reload -------------------------------------------------
+    def settings_window_open(self):
+        return self._settings_process is not None and self._settings_process.poll() is None
+
     def open_settings(self, icon=None, item=None):
-        if self._settings_process is not None and self._settings_process.poll() is None:
+        if self.settings_window_open():
             return
-        if getattr(sys, "frozen", False):
+        if is_frozen():
             args = [sys.executable, "--settings"]
         else:
             args = [sys.executable, os.path.abspath(__file__), "--settings"]
@@ -539,22 +1217,27 @@ class UnidleApp:
                 self.state.start_time = time.time() if settings["running"] else None
                 if settings["running"]:
                     self.state.last_keypress_time = None
-            self.state.running = settings["running"]
-            self.state.interval = settings["interval"]
-            self.state.randomize = settings["randomize"]
-            self.state.working_hours_enabled = settings["working_hours_enabled"]
-            self.state.working_hours_start = settings["working_hours_start"]
-            self.state.working_hours_end = settings["working_hours_end"]
-            self.state.working_days = settings["working_days"]
-            self.state.auto_stop_choice = settings["auto_stop_choice"]
-            self.state.notifications_enabled = settings["notifications_enabled"]
+            hotkey_changed = (
+                settings["hotkey_enabled"] != self.state.hotkey_enabled
+                or settings["hotkey"] != self.state.hotkey
+            )
+            autostart_changed = settings["autostart"] != self.state.autostart
+            for key in SETTINGS_KEYS:
+                setattr(self.state, key, settings[key])
             self.state._refresh_auto_stop_deadline()
+
         self.worker.reschedule()
+        self.worker.wake()
         self.refresh_icon()
+        self.icon.menu = self.build_menu()
         try:
             self.icon.update_menu()
         except Exception:
             pass
+        if hotkey_changed:
+            self.hotkey_listener.apply(settings["hotkey_enabled"], settings["hotkey"])
+        if autostart_changed and is_frozen():
+            set_autostart(settings["autostart"])
         if running_changed:
             log_event("toggle_on" if settings["running"] else "toggle_off")
 
@@ -580,15 +1263,23 @@ class UnidleApp:
     # -- icon / status -------------------------------------------------
     def current_status(self):
         with self.state.lock:
-            if not self.state.running:
-                return "off"
-            if self.state.working_hours_enabled and not is_within_working_hours(
-                self.state.working_hours_start,
-                self.state.working_hours_end,
-                self.state.working_days,
-            ):
-                return "outside_hours"
-            return "on"
+            running = self.state.running
+            wh_enabled = self.state.working_hours_enabled
+            wh_start = self.state.working_hours_start
+            wh_end = self.state.working_hours_end
+            wh_days = self.state.working_days
+            app_trigger_enabled = self.state.app_trigger_enabled
+        if not running:
+            return "off"
+        if wh_enabled and not is_within_working_hours(wh_start, wh_end, wh_days):
+            return "outside_hours"
+        if self.worker.lock_paused:
+            return "lock_paused"
+        if self.worker.battery_paused:
+            return "battery_paused"
+        if app_trigger_enabled and not self.worker.app_trigger_active:
+            return "waiting_app"
+        return "on"
 
     def _current_icon_image(self):
         return build_icon_image(self.current_status())
@@ -600,6 +1291,9 @@ class UnidleApp:
             "on": "ON",
             "off": "OFF",
             "outside_hours": "outside working hours",
+            "lock_paused": "paused — screen locked",
+            "battery_paused": "paused — low battery",
+            "waiting_app": "waiting for tracked app",
         }
         with self.state.lock:
             interval = self.state.interval
@@ -632,6 +1326,7 @@ class UnidleApp:
             self.state.running = value
             self.state.start_time = time.time() if value else None
             self.state.last_keypress_time = None if value else self.state.last_keypress_time
+            self.state.active_profile = None
             self.state._refresh_auto_stop_deadline()
         self.worker.reschedule()
         self.refresh_icon()
@@ -648,9 +1343,13 @@ class UnidleApp:
             new_value = not self.state.running
         self.set_running(new_value)
 
+    def _on_hotkey_triggered(self):
+        self.toggle_running()
+
     def set_interval(self, seconds):
         with self.state.lock:
             self.state.interval = seconds
+            self.state.active_profile = None
         self.worker.reschedule()
         self.refresh_icon()
         self.save()
@@ -658,30 +1357,53 @@ class UnidleApp:
     def set_randomize(self, icon=None, item=None):
         with self.state.lock:
             self.state.randomize = not self.state.randomize
+            self.state.active_profile = None
         self.worker.reschedule()
         self.save()
 
     def set_working_hours_enabled(self, icon=None, item=None):
         with self.state.lock:
             self.state.working_hours_enabled = not self.state.working_hours_enabled
+            self.state.active_profile = None
         self.refresh_icon()
         self.save()
 
     def set_auto_stop(self, choice):
         with self.state.lock:
             self.state.auto_stop_choice = choice
+            self.state.active_profile = None
             self.state._refresh_auto_stop_deadline()
         self.save()
 
     def set_notifications_enabled(self, icon=None, item=None):
         with self.state.lock:
             self.state.notifications_enabled = not self.state.notifications_enabled
+            self.state.active_profile = None
         self.save()
+
+    # -- profiles (Phase 2) -------------------------------------------------
+    def apply_profile(self, name, icon=None, item=None):
+        with self.state.lock:
+            profile = self.state.profiles.get(name)
+            if profile is None:
+                return
+            for key in PROFILE_KEYS:
+                if key in profile:
+                    setattr(self.state, key, profile[key])
+            self.state.active_profile = name
+            self.state._refresh_auto_stop_deadline()
+        self.worker.reschedule()
+        self.refresh_icon()
+        self.save()
+        log_event("profile_applied", detail=name)
+        self.notify(f'Applied profile "{name}".')
 
     def quit(self, icon=None, item=None):
         log_event("app_quit")
+        self.hotkey_listener.stop()
         self.worker.stop()
-        self.save()
+        self.worker.join(timeout=1.0)
+        save_settings(self.state.as_dict())
         self.icon.stop()
 
     # -- menu text/state helpers -------------------------------------------------
@@ -691,6 +1413,9 @@ class UnidleApp:
             "on": "🟢  Keeping online",
             "off": "⚪  Keep-online is off",
             "outside_hours": "🌙  Outside working hours",
+            "lock_paused": "🔒  Paused — screen locked",
+            "battery_paused": "🔋  Paused — low battery",
+            "waiting_app": "⏳  Waiting for tracked app…",
         }[status]
 
     def _runtime_text(self, item):
@@ -706,8 +1431,8 @@ class UnidleApp:
         duration = f"{h}h {m}m" if h else f"{m}m"
         if last_press:
             ago = int(time.time() - last_press)
-            return f"Active for {duration} · last keypress {ago}s ago"
-        return f"Active for {duration} · no keypress yet"
+            return f"Active for {duration} · last activity {ago}s ago"
+        return f"Active for {duration} · no activity yet"
 
     def _interval_menu_title(self, item):
         with self.state.lock:
@@ -772,6 +1497,16 @@ class UnidleApp:
 
             return pystray.MenuItem(choice, action, checked=checked, radio=True)
 
+        def profile_item(name):
+            def checked(item):
+                with self.state.lock:
+                    return self.state.active_profile == name
+
+            def action(icon, item):
+                self.apply_profile(name)
+
+            return pystray.MenuItem(name, action, checked=checked, radio=True)
+
         interval_submenu = pystray.MenuItem(
             self._interval_menu_title,
             pystray.Menu(*[interval_item(s) for s in INTERVAL_CHOICES]),
@@ -780,6 +1515,20 @@ class UnidleApp:
             self._auto_stop_menu_title,
             pystray.Menu(*[auto_stop_item(c) for c in AUTO_STOP_CHOICES]),
         )
+
+        with self.state.lock:
+            profile_names = sorted(self.state.profiles.keys())
+        if profile_names:
+            profiles_submenu = pystray.Menu(
+                *[profile_item(n) for n in profile_names],
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Save current as… (opens Settings)", self.open_settings),
+            )
+        else:
+            profiles_submenu = pystray.Menu(
+                pystray.MenuItem("No profiles yet — add one in Settings", self.open_settings),
+            )
+        profiles_menu_item = pystray.MenuItem("Profiles", profiles_submenu)
 
         return pystray.Menu(
             pystray.MenuItem(self._status_text, None, enabled=False),
@@ -804,6 +1553,7 @@ class UnidleApp:
                 self.set_notifications_enabled,
                 checked=self._notifications_checked,
             ),
+            profiles_menu_item,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._runtime_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -817,10 +1567,29 @@ class UnidleApp:
         log_event("app_start")
         if sys.platform == "darwin":
             setup_macos_double_click(icon, self)
+
+        with self.state.lock:
+            hotkey_enabled = self.state.hotkey_enabled
+            hotkey = self.state.hotkey
+        self.hotkey_listener.apply(hotkey_enabled, hotkey)
+
+        if self.first_run:
+            startup_msg = (
+                f"{APP_NAME} is running — find it in the system tray. "
+                "Double-click the icon to open Settings and get started."
+            )
+        else:
+            startup_msg = f"{APP_NAME} is running — find it in the system tray. Double-click the icon for settings."
+        try:
+            icon.notify(startup_msg, APP_NAME)
+        except Exception:
+            pass
+
         if self.first_run and sys.platform == "darwin":
             self.notify(
                 "Grant Accessibility (and Input Monitoring) permission in "
-                "System Settings so Unidle can send keypresses.",
+                "System Settings so Unidle can send keypresses and use the "
+                "global hotkey.",
                 title="Unidle — permission needed",
             )
 
@@ -844,6 +1613,7 @@ def main():
 
     if not acquire_single_instance():
         print(f"{APP_NAME} is already running.", file=sys.stderr)
+        show_already_running_alert()
         sys.exit(0)
 
     settings, first_run = load_settings()
