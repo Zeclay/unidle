@@ -1,0 +1,13 @@
+build/
+dist/
+__pycache__/
+*.spec
+venv/
+
+# Internal planning docs — not part of the published repo
+PLAN*.md
+IDEA.md
+assets/*.ico
+assets/*.icns
+assets/*.png
+assets/icon.iconset/
