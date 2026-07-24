@@ -513,6 +513,27 @@ def build_icon_image(status):
 # "Settings…" as the top item.
 # ---------------------------------------------------------------------------
 
+def setup_macos_menu_bar_only():
+    """Hide the Dock icon so Unidle lives only in the menu bar.
+
+    With a Dock icon present, macOS offers its own Quit paths (Dock
+    right-click → Quit, and Cmd+Q), which kill the process — and the menu
+    bar icon vanishes with it. Switching to the "accessory" activation
+    policy removes the Dock icon entirely, so the only way to quit is the
+    menu bar icon's own Quit item, which is what users expect from a
+    background tray app. Feature-detected and wrapped so a failure just
+    leaves the default (Dock icon present) behavior instead of crashing.
+    """
+    try:
+        import AppKit
+
+        AppKit.NSApp.setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass
+
+
 def setup_macos_double_click(icon, app):
     try:
         import AppKit
@@ -1586,6 +1607,7 @@ class UnidleApp:
         self.refresh_icon()
         log_event("app_start")
         if sys.platform == "darwin":
+            setup_macos_menu_bar_only()
             setup_macos_double_click(icon, self)
 
         with self.state.lock:
