@@ -600,10 +600,13 @@ def setup_macos_double_click(icon, app):
     except AttributeError:
         return
 
-    state = {"timer": None}
+    show_menu_selector = b"unidleShowMenu:"
 
     def _show_menu_now():
-        state["timer"] = None
+        # MUST run on the main thread — popUpStatusItemMenu_ is an AppKit UI
+        # call, and invoking it from a background thread corrupts macOS event
+        # routing (symptom: the previously focused app, e.g. Teams, can no
+        # longer receive keystrokes after the menu is shown).
         try:
             menu_handle = icon._menu_handle
             if not menu_handle:
@@ -611,6 +614,9 @@ def setup_macos_double_click(icon, app):
             status_item.popUpStatusItemMenu_(menu_handle[0])
         except Exception:
             pass
+
+    def _on_show_menu(_self, _obj):
+        _show_menu_now()
 
     def _on_click(_self, _sender):
         try:
@@ -620,10 +626,14 @@ def setup_macos_double_click(icon, app):
         except Exception:
             event_type = None
             click_count = 1
-        existing_timer = state["timer"]
-        if existing_timer is not None:
-            existing_timer.cancel()
-            state["timer"] = None
+        # Cancel any pending single-click menu-open scheduled below; a second
+        # click within the delay means this is a double-click.
+        try:
+            AppKit.NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+                delegate, show_menu_selector, None
+            )
+        except Exception:
+            pass
         # Right-click (or control-click, which macOS reports as a right
         # mouse up) opens the menu immediately — no double-click wait, since
         # right-click has no "open Settings" gesture to disambiguate from.
@@ -645,15 +655,24 @@ def setup_macos_double_click(icon, app):
             except Exception:
                 pass
             return
-        timer = threading.Timer(0.25, _show_menu_now)
-        timer.daemon = True
-        state["timer"] = timer
-        timer.start()
+        # Single left-click: wait briefly for a possible second click, then
+        # show the menu. Scheduled via performSelector:afterDelay: so it fires
+        # on the main run loop (we're on the main thread here) — never a
+        # background thread. cancelPrevious... above collapses a double-click.
+        try:
+            delegate.performSelector_withObject_afterDelay_(
+                show_menu_selector, None, 0.25
+            )
+        except Exception:
+            _show_menu_now()
 
     try:
         selector_name = b"unidleStatusClick:"
         action = objc.selector(_on_click, selector=selector_name, signature=b"v@:@")
-        objc.classAddMethods(type(delegate), [action])
+        show_action = objc.selector(
+            _on_show_menu, selector=show_menu_selector, signature=b"v@:@"
+        )
+        objc.classAddMethods(type(delegate), [action, show_action])
         button.setTarget_(delegate)
         button.setAction_(selector_name)
         button.sendActionOn_(
